@@ -1,8 +1,11 @@
 import pandas as pd
 import streamlit as st
+import altair as alt
 
-st.set_page_config(layout="wide")
-
+st.set_page_config(
+    page_title="Bookstore B2B  Dashboard",
+    page_icon="chart_with_upwards_trend",
+    layout="wide")
 
 st.markdown("""
 <style>
@@ -77,14 +80,32 @@ h1, h2, h3, p, label {
 def prepare_data(file_name):
     data = pd.read_excel(file_name)
     data = data.drop_duplicates()
-
+    data= data.dropna()
+    data = data[
+        (data["Quantity"] > 0) &
+        (data["NetPrice"] > 0) &
+        (data["UnitPrice"] > 0)
+    ]
+    data["InvoiceDate"] = pd.to_datetime(data["InvoiceDate"])
     data["SalesAmount"] = data["Quantity"] * data["NetPrice"]
+    data["Week"] = data["InvoiceDate"].dt.isocalendar().week
+    data["Month"] = data["InvoiceDate"].dt.month
 
     return data
 
 
+def format_number(value, decimal_places=0):
+    number = f"{value:,.{decimal_places}f}"
+    return number.replace(",", "X").replace(".", ",").replace("X", ".")
+
+
+def format_change(value, decimal_places=0):
+    sign = "+" if value > 0 else ""
+    return sign + format_number(value, decimal_places)
+
+
 def reset_filters(tab_name):
-    for name in ["date", "description", "category", "city"]:
+    for name in ["date", "week", "month", "description", "category", "city"]:
         st.session_state[f"{tab_name}_{name}"] = []
 
     st.session_state[f"{tab_name}_applied"] = False
@@ -97,21 +118,25 @@ def show_filters(data, tab_name, options):
         st.session_state[applied_key] = False
 
     with st.form(f"{tab_name}_filter_form"):
-        columns = st.columns(4)
+        columns = st.columns(6)
 
         with columns[0]:
             st.multiselect("Invoice Date", options["dates"], key=f"{tab_name}_date")
         with columns[1]:
+            st.multiselect("Week", options["weeks"], key=f"{tab_name}_week")
+        with columns[2]:
+            st.multiselect("Month", options["months"], key=f"{tab_name}_month")
+        with columns[3]:
             st.multiselect(
                 "Description", options["descriptions"],
                 key=f"{tab_name}_description"
             )
-        with columns[2]:
+        with columns[4]:
             st.multiselect(
                 "Category", options["categories"],
                 key=f"{tab_name}_category"
             )
-        with columns[3]:
+        with columns[5]:
             st.multiselect("City", options["cities"], key=f"{tab_name}_city")
 
         apply_col, reset_col = st.columns(2)
@@ -134,6 +159,8 @@ def show_filters(data, tab_name, options):
 
     if st.session_state[applied_key]:
         selected_dates = st.session_state[f"{tab_name}_date"]
+        selected_weeks = st.session_state[f"{tab_name}_week"]
+        selected_months = st.session_state[f"{tab_name}_month"]
         selected_descriptions = st.session_state[f"{tab_name}_description"]
         selected_categories = st.session_state[f"{tab_name}_category"]
         selected_cities = st.session_state[f"{tab_name}_city"]
@@ -141,6 +168,16 @@ def show_filters(data, tab_name, options):
         if selected_dates:
             filtered_data = filtered_data[
                 filtered_data["InvoiceDate"].astype(str).isin(selected_dates)
+            ]
+
+        if selected_weeks:
+            filtered_data = filtered_data[
+                filtered_data["Week"].isin(selected_weeks)
+            ]
+
+        if selected_months:
+            filtered_data = filtered_data[
+                filtered_data["Month"].isin(selected_months)
             ]
 
         if selected_descriptions:
@@ -184,10 +221,301 @@ def show_chart_placeholders(titles):
                 )
 
 
+def style_chart(chart):
+    return (
+        chart
+        .properties(height=280)
+        .configure_view(strokeWidth=0)
+        .configure_axis(
+            gridColor="#EEEEEE",
+            labelColor="#555555",
+            titleColor="#333333",
+        )
+        .configure_legend(
+            labelColor="#555555",
+            titleColor="#333333",
+        )
+        .configure(
+            locale={
+                "number": {
+                    "decimal": ",",
+                    "thousands": ".",
+                    "grouping": [3],
+                    "currency": ["", ""],
+                }
+            }
+        )
+    )
+
+
+def show_chart(column, title, chart, is_empty):
+    with column:
+        with st.container(border=True):
+            st.markdown(f"**{title}**")
+
+            if is_empty:
+                st.info("No data available for the selected filters.")
+            else:
+                st.altair_chart(style_chart(chart), use_container_width=True)
+
+
+def show_sales_charts(
+    period_data,
+    monthly_sales,
+    weekly_sales,
+    city_sales,
+):
+    monthly_chart = monthly_sales.rename_axis("Month").reset_index(
+        name="SalesAmount"
+    )
+    monthly_chart["Month"] = monthly_chart["Month"].astype(str)
+    monthly_chart["SalesAmount"] = monthly_chart["SalesAmount"].round().astype(int)
+
+    weekly_chart = weekly_sales.rename_axis("Week").reset_index(
+        name="SalesAmount"
+    )
+    weekly_chart["Week"] = [
+        week.start_time.strftime("%G-W%V") for week in weekly_chart["Week"]
+    ]
+    weekly_chart["SalesAmount"] = weekly_chart["SalesAmount"].round().astype(int)
+
+    monthly_change = monthly_sales.pct_change(fill_method=None) * 100
+    monthly_change = monthly_change.replace(
+        [float("inf"), float("-inf")], pd.NA
+    ).dropna()
+    monthly_change_chart = monthly_change.rename_axis("Month").reset_index(
+        name="ChangePercent"
+    )
+    monthly_change_chart["Month"] = monthly_change_chart["Month"].astype(str)
+    monthly_change_chart["ChangePercent"] = (
+        monthly_change_chart["ChangePercent"].round(1)
+    )
+    monthly_change_chart["ChangeLabel"] = monthly_change_chart[
+        "ChangePercent"
+    ].apply(lambda value: f"{format_change(value, 1)}%")
+
+    city_chart = (
+        city_sales.nlargest(10)
+        .rename_axis("City")
+        .reset_index(name="SalesAmount")
+    )
+    city_chart["SalesAmount"] = city_chart["SalesAmount"].round().astype(int)
+
+    top_5_cities = city_sales.nlargest(5).index
+    top_5_sales = city_sales.nlargest(5).sum()
+    other_cities_sales = city_sales.sum() - top_5_sales
+
+    city_share = pd.DataFrame({
+        "City Group": ["Top 5 Cities", "Other Cities"],
+        "SalesAmount": [top_5_sales, other_cities_sales],
+    })
+    city_share["SalesAmount"] = city_share["SalesAmount"].round().astype(int)
+    city_share["Share"] = (
+        city_share["SalesAmount"] / city_share["SalesAmount"].sum()
+        if city_share["SalesAmount"].sum() > 0 else 0
+    )
+
+    top_city_data = period_data[
+        period_data["City"].isin(top_5_cities)
+    ].copy()
+    top_city_data["Month"] = (
+        top_city_data["InvoiceDate"].dt.to_period("M").astype(str)
+    )
+    top_city_data["Week"] = top_city_data["InvoiceDate"].dt.strftime("%G-W%V")
+
+    monthly_city = (
+        top_city_data.groupby(["Month", "City"])["SalesAmount"]
+        .sum()
+        .round()
+        .astype(int)
+        .reset_index()
+    )
+
+    weekly_city = (
+        top_city_data.groupby(["Week", "City"])["SalesAmount"]
+        .sum()
+        .round()
+        .astype(int)
+        .reset_index()
+    )
+
+    sales_tooltip = alt.Tooltip(
+        "SalesAmount:Q",
+        title="Sales Amount",
+        format=",.0f",
+    )
+
+    monthly_line = (
+        alt.Chart(monthly_chart)
+        .mark_line(color="#B4232F", point=True, strokeWidth=2)
+        .encode(
+            x=alt.X("Month:O", title="Month"),
+            y=alt.Y(
+                "SalesAmount:Q",
+                title="Sales Amount",
+                axis=alt.Axis(format=",.0f"),
+            ),
+            tooltip=[alt.Tooltip("Month:O", title="Month"), sales_tooltip],
+        )
+    )
+
+    city_bar = (
+        alt.Chart(city_chart)
+        .mark_bar(color="#B4232F", cornerRadiusEnd=3)
+        .encode(
+            x=alt.X(
+                "SalesAmount:Q",
+                title="Sales Amount",
+                axis=alt.Axis(format=",.0f"),
+            ),
+            y=alt.Y("City:N", title="City", sort="-x"),
+            tooltip=[alt.Tooltip("City:N", title="City"), sales_tooltip],
+        )
+    )
+
+    share_donut = (
+        alt.Chart(city_share)
+        .mark_arc(innerRadius=65, outerRadius=100)
+        .encode(
+            theta=alt.Theta("SalesAmount:Q"),
+            color=alt.Color(
+                "City Group:N",
+                scale=alt.Scale(range=["#B4232F", "#E5E5E5"]),
+                legend=alt.Legend(title=None),
+            ),
+            tooltip=[
+                alt.Tooltip("City Group:N", title="City Group"),
+                sales_tooltip,
+                alt.Tooltip("Share:Q", title="Share", format=".1%"),
+            ],
+        )
+    )
+
+    city_colors = alt.Scale(
+        range=["#B4232F", "#D75B65", "#E58B92", "#6F6F6F", "#AFAFAF"]
+    )
+
+    monthly_city_line = (
+        alt.Chart(monthly_city)
+        .mark_line(point=True, strokeWidth=2)
+        .encode(
+            x=alt.X("Month:O", title="Month"),
+            y=alt.Y(
+                "SalesAmount:Q",
+                title="Sales Amount",
+                axis=alt.Axis(format=",.0f"),
+            ),
+            color=alt.Color("City:N", scale=city_colors, legend=alt.Legend(title=None)),
+            tooltip=[
+                alt.Tooltip("Month:O", title="Month"),
+                alt.Tooltip("City:N", title="City"),
+                sales_tooltip,
+            ],
+        )
+    )
+
+    weekly_line = (
+        alt.Chart(weekly_chart)
+        .mark_line(color="#B4232F", point=True, strokeWidth=2)
+        .encode(
+            x=alt.X("Week:O", title="Week"),
+            y=alt.Y(
+                "SalesAmount:Q",
+                title="Sales Amount",
+                axis=alt.Axis(format=",.0f"),
+            ),
+            tooltip=[alt.Tooltip("Week:O", title="Week"), sales_tooltip],
+        )
+    )
+
+    weekly_city_line = (
+        alt.Chart(weekly_city)
+        .mark_line(point=True, strokeWidth=2)
+        .encode(
+            x=alt.X("Week:O", title="Week"),
+            y=alt.Y(
+                "SalesAmount:Q",
+                title="Sales Amount",
+                axis=alt.Axis(format=",.0f"),
+            ),
+            color=alt.Color("City:N", scale=city_colors, legend=alt.Legend(title=None)),
+            tooltip=[
+                alt.Tooltip("Week:O", title="Week"),
+                alt.Tooltip("City:N", title="City"),
+                sales_tooltip,
+            ],
+        )
+    )
+
+    monthly_change_bar = (
+        alt.Chart(monthly_change_chart)
+        .mark_bar(cornerRadiusEnd=3)
+        .encode(
+            x=alt.X("Month:O", title="Month"),
+            y=alt.Y(
+                "ChangePercent:Q",
+                title="Change (%)",
+                axis=alt.Axis(format="+.0f"),
+            ),
+            color=alt.condition(
+                alt.datum.ChangePercent >= 0,
+                alt.value("#2E8B57"),
+                alt.value("#B4232F"),
+            ),
+            tooltip=[
+                alt.Tooltip("Month:O", title="Month"),
+                alt.Tooltip("ChangeLabel:N", title="Change"),
+            ],
+        )
+    )
+
+    left, right = st.columns(2)
+    show_chart(left, "Monthly Sales Trend", monthly_line, monthly_chart.empty)
+    show_chart(
+        right,
+        "Top 10 Cities by Total Sales Amount",
+        city_bar,
+        city_chart.empty,
+    )
+
+    left, right = st.columns(2)
+    show_chart(
+        left,
+        "Top 5 Cities vs Other Cities",
+        share_donut,
+        city_share["SalesAmount"].sum() == 0,
+    )
+    show_chart(
+        right,
+        "Monthly Sales Trend of Top 5 Cities",
+        monthly_city_line,
+        monthly_city.empty,
+    )
+
+    left, right = st.columns(2)
+    show_chart(left, "Weekly Sales Trend", weekly_line, weekly_chart.empty)
+    show_chart(
+        right,
+        "Weekly Sales Trend of Top 5 Cities",
+        weekly_city_line,
+        weekly_city.empty,
+    )
+
+    full_width = st.container()
+    show_chart(
+        full_width,
+        "Month-to-Month Sales Change (%)",
+        monthly_change_bar,
+        monthly_change_chart.empty,
+    )
+
+
 data = prepare_data("B2B_Transaction_Data_.xlsx")
 
 filter_options = {
     "dates": sorted(data["InvoiceDate"].dropna().astype(str).unique()),
+    "weeks": sorted(data["Week"].dropna().unique()),
+    "months": sorted(data["Month"].dropna().unique()),
     "descriptions": sorted(data["Description"].dropna().astype(str).unique()),
     "categories": sorted(data["Category"].dropna().astype(str).unique()),
     "cities": sorted(data["City"].dropna().astype(str).unique()),
@@ -227,23 +555,11 @@ with sales_tab:
         .sum()
     )
 
-    category_sales = (
-        sales_data.dropna(subset=["Category"])
-        .groupby("Category")["SalesAmount"]
-        .sum()
-    )
-
     top_city = city_sales.idxmax() if not city_sales.empty else "—"
     top_city_sales = city_sales.max() if not city_sales.empty else 0
-    top_city_share = (
-        top_city_sales / total_sales * 100 if total_sales else 0
-    )
-
-    top_category = (
-        category_sales.idxmax() if not category_sales.empty else "—"
-    )
-    top_category_sales = (
-        category_sales.max() if not category_sales.empty else 0
+    top_5_cities_sales = city_sales.nlargest(5).sum()
+    top_5_cities_share = (
+        top_5_cities_sales / total_sales * 100 if total_sales else 0
     )
 
     period_data = sales_data.copy()
@@ -260,6 +576,31 @@ with sales_tab:
         period_data["InvoiceDate"].dt.to_period("W")
     )["SalesAmount"].sum().sort_index()
 
+    if not weekly_sales.empty:
+        all_weeks = pd.period_range(
+            weekly_sales.index.min(),
+            weekly_sales.index.max(),
+            freq="W",
+        )
+        weekly_sales = weekly_sales.reindex(all_weeks, fill_value=0)
+
+    weekly_change_sales = weekly_sales.copy()
+
+    if not weekly_change_sales.empty:
+        first_week = weekly_change_sales.index[0]
+        last_week = weekly_change_sales.index[-1]
+        first_date = period_data["InvoiceDate"].min().normalize()
+        last_date = period_data["InvoiceDate"].max().normalize()
+
+        if first_date > first_week.start_time.normalize():
+            weekly_change_sales = weekly_change_sales.iloc[1:]
+
+        last_complete_day = (
+            last_week.start_time + pd.Timedelta(days=5)
+        ).normalize()
+        if last_date < last_complete_day:
+            weekly_change_sales = weekly_change_sales.iloc[:-1]
+
     month_percent = None
     month_amount = None
     if len(monthly_sales) > 1:
@@ -271,9 +612,9 @@ with sales_tab:
 
     week_percent = None
     week_amount = None
-    if len(weekly_sales) > 1:
-        previous = weekly_sales.iloc[-2]
-        current = weekly_sales.iloc[-1]
+    if len(weekly_change_sales) > 1:
+        previous = weekly_change_sales.iloc[-2]
+        current = weekly_change_sales.iloc[-1]
         week_amount = current - previous
         if previous != 0:
             week_percent = week_amount / previous * 100
@@ -284,10 +625,13 @@ with sales_tab:
             unsafe_allow_html=True,
         )
         columns = st.columns(4)
-        columns[0].metric("Total Sales", f"{total_sales:,.0f}")
-        columns[1].metric("Total Orders", f"{total_orders:,}")
-        columns[2].metric("Units Sold", f"{units_sold:,.0f}")
-        columns[3].metric("Average Sales per Invoice", f"{average_sales:,.2f}")
+        columns[0].metric("Total Sales", format_number(total_sales))
+        columns[1].metric("Total Orders", format_number(total_orders))
+        columns[2].metric("Units Sold", format_number(units_sold))
+        columns[3].metric(
+            "Average Sales per Order",
+            format_number(average_sales, 2),
+        )
 
     with lower_cards:
         left, right = st.columns(2)
@@ -299,15 +643,15 @@ with sales_tab:
             )
             columns = st.columns(2)
             columns[0].metric(
-                "Top City Sales Amount Share",
-                f"{top_city} · {top_city_share:.1f}%",
-                f"Sales: {top_city_sales:,.0f}",
+                "Top City",
+                top_city,
+                f"Sales: {format_number(top_city_sales)}",
                 delta_color="off",
             )
             columns[1].metric(
-                "Top Category",
-                top_category,
-                f"Sales: {top_category_sales:,.0f}",
+                "Top 5 Cities Share",
+                f"{format_number(top_5_cities_share, 1)}%",
+                f"Sales: {format_number(top_5_cities_sales)}",
                 delta_color="off",
             )
 
@@ -319,16 +663,21 @@ with sales_tab:
             columns = st.columns(2)
             columns[0].metric(
                 "Month-to-Month Sales Change",
-                f"{month_percent:+.1f}%" if month_percent is not None else "—",
-                f"{month_amount:+,.0f}" if month_amount is not None else None,
+                f"{format_change(month_percent, 1)}%" if month_percent is not None else "—",
+                format_change(month_amount) if month_amount is not None else None,
             )
             columns[1].metric(
                 "Week-to-Week Sales Change",
-                f"{week_percent:+.1f}%" if week_percent is not None else "—",
-                f"{week_amount:+,.0f}" if week_amount is not None else None,
+                f"{format_change(week_percent, 1)}%" if week_percent is not None else "—",
+                format_change(week_amount) if week_amount is not None else None,
             )
 
-    show_chart_placeholders(["Monthly Sales Trend", "Sales by City"])
+    show_sales_charts(
+        period_data,
+        monthly_sales,
+        weekly_sales,
+        city_sales,
+    )
 
 with customer_tab:
     show_cards(["Customers", "Repeat Customers", "Customer Value", "RFM Segment"])
