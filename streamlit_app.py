@@ -2,6 +2,7 @@ import pandas as pd
 import streamlit as st
 import altair as alt
 
+import data_utils as du
 import forecast_utils as fu
 
 st.set_page_config(
@@ -80,35 +81,18 @@ h1, h2, h3, p, label {
 
 
 @st.cache_data(show_spinner="Loading data...")
-def _load_dashboard_data(file_name):
+def load_dashboard_bundle(file_name):
+    """Read the Excel file once; return the cleaned Sales data and small
+    Forecast artifacts built from that same data (no second row table)."""
     raw = pd.read_excel(file_name)
-    duplicates = fu.duplicate_summary(raw)
-    data = raw.drop_duplicates()
-
-    # Forecast keeps every deduplicated row; its own rules (Unknown category,
-    # returns split, numeric Quantity) are applied in prepare_forecast_data.
-    forecast_rows = data[["InvoiceDate", "Category", "Quantity"]].copy()
-    forecast_rows["InvoiceDate"] = pd.to_datetime(
-        forecast_rows["InvoiceDate"], errors="coerce"
-    )
-    forecast_rows["Category"] = forecast_rows["Category"].astype("category")
-
-    data = data.dropna()
-    data = data[
-        (data["Quantity"] > 0) &
-        (data["NetPrice"] > 0) &
-        (data["UnitPrice"] > 0)
-    ]
-    data["InvoiceDate"] = pd.to_datetime(data["InvoiceDate"])
-    data["SalesAmount"] = data["Quantity"] * data["NetPrice"]
-    data["Week"] = data["InvoiceDate"].dt.isocalendar().week
-    data["Month"] = data["InvoiceDate"].dt.month
-
-    return data, forecast_rows, duplicates
+    duplicates = du.clean_transactions(raw[raw.duplicated()])
+    data = du.clean_transactions(raw.drop_duplicates())
+    forecast = fu.build_forecast_artifacts(data, duplicates)
+    return data, forecast
 
 
 def prepare_data(file_name):
-    data, _, _ = _load_dashboard_data(file_name)
+    data, _ = load_dashboard_bundle(file_name)
     return data
 
 
@@ -528,40 +512,17 @@ def show_sales_charts(
     )
 
 
-@st.cache_data(show_spinner=False)
-def prepare_forecast_data(file_name):
-    _, forecast_rows, duplicates = _load_dashboard_data(file_name)
-    sales, _, notes = fu.clean_quantity(forecast_rows)
-    start, end = sales["InvoiceDate"].min(), sales["InvoiceDate"].max()
-    weekly_table = fu.build_weekly_table(sales, start, end)
-
-    duplicate_sales, _, _ = fu.clean_quantity(duplicates["rows"])
-    duplicate_table = fu.build_weekly_table(duplicate_sales, start, end).reindex(
-        index=weekly_table.index, columns=weekly_table.columns, fill_value=0
-    )
-    duplicate_info = {key: value for key, value in duplicates.items() if key != "rows"}
-    duplicate_info.update(fu.duplicate_effect(weekly_table, duplicate_table))
-
-    notes["last_date"] = end
-    notes["partial_week"] = (
-        fu.week_start(pd.Series([end])).iloc[0] if end.dayofweek != 6 else None
-    )
-    notes["partial_days"] = int(end.dayofweek) + 1
-    return weekly_table, notes, duplicate_info
-
-
 def show_method_notes(notes, duplicate_info, test_weeks):
-    excluded_rows = (
-        notes["missing_or_zero_quantity_rows"] + notes["non_numeric_quantity_rows"]
-    )
     with st.expander("Method notes"):
         st.markdown(f"""
-**Weekly demand.** `Quantity` is converted with `pd.to_numeric(errors="coerce")`
-and summed per Monday-start week; weeks without sales count as 0. Rows with a
-missing date or a missing, zero or non-numeric quantity are excluded
-({excluded_rows:,} rows). Negative quantities are treated as possible returns
-and kept out of demand ({notes["return_rows"]:,} found). Weeks that do not cover
-seven days of data are excluded.
+**Data base.** Forecast uses the same valid transactions as the Sales tab:
+exact duplicates removed, rows with any missing field dropped, positive
+Quantity, NetPrice and UnitPrice, and a valid InvoiceDate
+({notes["input_rows"]:,} rows, {notes["input_units"]:,.0f} units). Only
+InvoiceDate, Category and Quantity are used.
+
+**Weekly demand.** Quantity is summed per Monday-start week; weeks without
+sales count as 0. Weeks that do not cover seven days of data are excluded.
 
 **Model selection and backtest.** The last {test_weeks} weeks are held out as
 the test period. Naive (last week's actual) and Moving Averages over 2, 4 and 8
@@ -581,8 +542,10 @@ methods (e.g. Croston), which are out of scope.
 """)
 
 
-def show_forecast_tab(file_name):
-    weekly_table, notes, duplicate_info = prepare_forecast_data(file_name)
+def show_forecast_tab(forecast):
+    weekly_table = forecast["weekly_table"]
+    notes = forecast["notes"]
+    duplicate_info = forecast["duplicate_info"]
     categories = sorted(c for c in weekly_table.columns if c != fu.TOTAL)
 
     with st.form("forecast_form"):
@@ -696,7 +659,7 @@ def show_forecast_tab(file_name):
     show_method_notes(notes, duplicate_info, test_weeks)
 
 
-data = prepare_data("B2B_Transaction_Data_.xlsx")
+data, forecast_bundle = load_dashboard_bundle("B2B_Transaction_Data_.xlsx")
 
 filter_options = {
     "dates": sorted(data["InvoiceDate"].dropna().astype(str).unique()),
@@ -878,7 +841,7 @@ with product_tab:
     show_chart_placeholders(["Sales by Category", "Top Products"])
 
 with forecast_tab:
-    show_forecast_tab("B2B_Transaction_Data_.xlsx")
+    show_forecast_tab(forecast_bundle)
 
 with raw_tab:
     st.markdown('<div class="section-title">Filters</div>', unsafe_allow_html=True)

@@ -1,6 +1,7 @@
 import pandas as pd
 import pytest
 
+import data_utils as du
 import forecast_utils as fu
 
 
@@ -177,20 +178,73 @@ def test_text_quantity_is_coerced():
     assert notes["missing_or_zero_quantity_rows"] == 1
 
 
+def transactions(rows):
+    columns = ["InvoiceNo", "StockCode", "InvoiceDate", "Category", "City",
+               "Quantity", "NetPrice", "UnitPrice"]
+    return pd.DataFrame(rows, columns=columns)
+
+
+def clean_like_app(raw):
+    """Same steps as load_dashboard_bundle in streamlit_app.py."""
+    duplicates = du.clean_transactions(raw[raw.duplicated()])
+    data = du.clean_transactions(raw.drop_duplicates())
+    return data, duplicates
+
+
 def test_duplicate_summary_counts_exact_rows_only():
-    data = pd.DataFrame({
-        "InvoiceNo": ["X1", "X1", "X1", "X2"],
-        "StockCode": [1, 1, 1, 1],
-        "InvoiceDate": ["2020-01-06"] * 4,
-        "Category": ["A"] * 4,
-        "Quantity": [2, 2, 3, 2],
-    })
-    summary = fu.duplicate_summary(data)
-    assert summary["row_count"] == 1  # same invoice+stock with Quantity 3 is kept
+    raw = transactions([
+        ("X1", 1, "2020-01-06", "A", "IST", 2, 10.0, 12.0),
+        ("X1", 1, "2020-01-06", "A", "IST", 2, 10.0, 12.0),  # exact duplicate
+        ("X1", 1, "2020-01-06", "A", "IST", 3, 10.0, 12.0),  # same invoice+stock, kept
+        ("X2", 1, "2020-01-06", "A", "IST", 2, 10.0, 12.0),
+        ("X3", 1, "2020-01-06", "A", None, 4, 10.0, 12.0),   # invalid: missing City
+        ("X3", 1, "2020-01-06", "A", None, 4, 10.0, 12.0),   # invalid duplicate
+    ])
+    data, duplicates = clean_like_app(raw)
+    summary = fu.duplicate_summary(data, duplicates)
+    assert summary["row_count"] == 1
+    assert summary["total_rows"] == 4
     assert summary["units"] == 2
     assert summary["row_share"] == 25
     assert summary["unit_share"] == pytest.approx(2 / 9 * 100)
-    assert len(summary["rows"]) == 1
+
+
+def sample_raw():
+    rows = []
+    for week in range(3):
+        monday = pd.Timestamp("2020-01-06") + pd.Timedelta(weeks=week)
+        sunday = monday + pd.Timedelta(days=6)
+        rows += [
+            (f"I{week}a", 1, str(monday.date()), "A", "IST", 5, 10.0, 12.0),
+            (f"I{week}b", 2, str(sunday.date()), "B", "ANK", 3, 20.0, 25.0),
+            (f"I{week}c", 3, str(monday.date()), "B", None, 7, 20.0, 25.0),
+            (f"I{week}d", 4, str(monday.date()), "A", "IST", -2, 10.0, 12.0),
+            (f"I{week}e", 5, str(monday.date()), "A", "IST", 4, 0.0, 12.0),
+        ]
+    rows.append(rows[0])  # one exact duplicate
+    return transactions(rows)
+
+
+def test_forecast_uses_same_quantity_as_sales():
+    data, duplicates = clean_like_app(sample_raw())
+    forecast = fu.build_forecast_artifacts(data, duplicates)
+    notes = forecast["notes"]
+    assert notes["input_rows"] == len(data)
+    assert notes["input_units"] == data["Quantity"].sum()
+    assert forecast["weekly_table"][fu.TOTAL].sum() == data["Quantity"].sum()
+    assert notes["return_rows"] == 0  # negative quantities never reach Forecast
+    assert fu.UNKNOWN_CATEGORY not in forecast["weekly_table"].columns
+
+
+def test_forecast_artifacts_keep_no_row_level_table():
+    data, duplicates = clean_like_app(sample_raw())
+    forecast = fu.build_forecast_artifacts(data, duplicates)
+    frames = [value for value in forecast.values()
+              if isinstance(value, (pd.DataFrame, pd.Series))]
+    assert len(frames) == 1 and frames[0] is forecast["weekly_table"]
+    assert len(forecast["weekly_table"]) == 3  # one row per week, not per transaction
+    for value in list(forecast["notes"].values()) + list(forecast["duplicate_info"].values()):
+        assert not isinstance(value, (pd.DataFrame, pd.Series))
 
 
 def test_insufficient_data_warns():

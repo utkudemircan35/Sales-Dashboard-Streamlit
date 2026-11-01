@@ -14,21 +14,19 @@ MIN_ACTIVE_SHARE = 0.5
 NEUTRAL_BIAS = "neutral/no bias"
 
 
-def duplicate_summary(raw):
-    """Count exact duplicate rows (every column identical) and their units.
+def duplicate_summary(transactions, duplicates):
+    """Exact duplicate rows that pass the cleaning rules, and their units.
 
-    Returns a dict with row/unit counts and shares plus `rows`: the duplicate
-    copies that drop_duplicates() would remove (InvoiceDate, Category, Quantity).
+    `transactions` is the cleaned, deduplicated base; `duplicates` holds the
+    removed duplicate copies after the same cleaning rules.
     """
-    duplicated = raw.duplicated()
-    quantity = pd.to_numeric(raw["Quantity"], errors="coerce")
-    total_units = float(quantity.sum())
-    units = float(quantity[duplicated].sum())
+    total_rows = len(transactions) + len(duplicates)
+    units = float(duplicates["Quantity"].sum())
+    total_units = float(transactions["Quantity"].sum()) + units
     return {
-        "rows": raw.loc[duplicated, ["InvoiceDate", "Category", "Quantity"]].copy(),
-        "row_count": int(duplicated.sum()),
-        "total_rows": int(len(raw)),
-        "row_share": float(duplicated.mean()) * 100 if len(raw) else 0.0,
+        "row_count": int(len(duplicates)),
+        "total_rows": int(total_rows),
+        "row_share": len(duplicates) / total_rows * 100 if total_rows else 0.0,
         "units": units,
         "unit_share": units / total_units * 100 if total_units else 0.0,
     }
@@ -331,6 +329,38 @@ def duplicate_effect(weekly_table, duplicate_table, test_weeks=DEFAULT_TEST_WEEK
     }
 
 
+def build_forecast_artifacts(transactions, duplicates):
+    """Small, cacheable Forecast inputs built from the cleaned Sales base.
+
+    Returns a dict with the weekly table (complete weeks only), notes about
+    the input and partial weeks, and duplicate metadata. No row-level table is
+    kept, so caching it does not store a second copy of the transactions.
+    """
+    sales, _, notes = clean_quantity(transactions)
+    start, end = sales["InvoiceDate"].min(), sales["InvoiceDate"].max()
+    weekly_table = build_weekly_table(sales, start, end)
+
+    duplicate_sales, _, _ = clean_quantity(duplicates)
+    duplicate_table = build_weekly_table(duplicate_sales, start, end).reindex(
+        index=weekly_table.index, columns=weekly_table.columns, fill_value=0
+    )
+    duplicate_info = duplicate_summary(transactions, duplicates)
+    duplicate_info.update(duplicate_effect(weekly_table, duplicate_table))
+
+    notes["input_rows"] = int(len(sales))
+    notes["input_units"] = float(sales["Quantity"].sum())
+    notes["last_date"] = end
+    notes["partial_week"] = (
+        week_start(pd.Series([end])).iloc[0] if end.dayofweek != 6 else None
+    )
+    notes["partial_days"] = int(end.dayofweek) + 1
+    return {
+        "weekly_table": weekly_table,
+        "notes": notes,
+        "duplicate_info": duplicate_info,
+    }
+
+
 def improvement_card(result):
     """(label, value, caption) for the improvement card of a ForecastResult."""
     def percent(value):
@@ -360,11 +390,11 @@ def duplicate_note(duplicate_info):
     text = (
         "**Duplicate rows.** A duplicate is a row whose every column is identical "
         "to an earlier row. As in all other tabs, these rows are removed with "
-        f"`drop_duplicates()`: {duplicate_info['row_count']:,} of "
-        f"{duplicate_info['total_rows']:,} rows ({duplicate_info['row_share']:.2f}%), "
-        f"{duplicate_info['units']:,.0f} units ({duplicate_info['unit_share']:.2f}% "
-        "of total quantity). Rows that share an invoice and stock code but differ "
-        "in any field are kept."
+        "`drop_duplicates()`. Among valid transactions they are "
+        f"{duplicate_info['row_count']:,} of {duplicate_info['total_rows']:,} rows "
+        f"({duplicate_info['row_share']:.2f}%), {duplicate_info['units']:,.0f} units "
+        f"({duplicate_info['unit_share']:.2f}% of valid quantity). Rows that share "
+        "an invoice and stock code but differ in any field are kept."
     )
     setting = f"the default {DEFAULT_TEST_WEEKS}-week test setting"
     status = duplicate_info["ranking_status"]
