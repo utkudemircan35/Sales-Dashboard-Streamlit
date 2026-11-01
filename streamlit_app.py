@@ -2,6 +2,9 @@ import pandas as pd
 import streamlit as st
 import altair as alt
 
+import data_utils as du
+import forecast_utils as fu
+
 st.set_page_config(
     page_title="Bookstore B2B  Dashboard",
     page_icon="chart_with_upwards_trend",
@@ -77,20 +80,19 @@ h1, h2, h3, p, label {
 """, unsafe_allow_html=True)
 
 
-def prepare_data(file_name):
-    data = pd.read_excel(file_name)
-    data = data.drop_duplicates()
-    data= data.dropna()
-    data = data[
-        (data["Quantity"] > 0) &
-        (data["NetPrice"] > 0) &
-        (data["UnitPrice"] > 0)
-    ]
-    data["InvoiceDate"] = pd.to_datetime(data["InvoiceDate"])
-    data["SalesAmount"] = data["Quantity"] * data["NetPrice"]
-    data["Week"] = data["InvoiceDate"].dt.isocalendar().week
-    data["Month"] = data["InvoiceDate"].dt.month
+@st.cache_data(show_spinner="Loading data...")
+def load_dashboard_bundle(file_name):
+    """Read the Excel file once; return the cleaned Sales data and small
+    Forecast artifacts built from that same data (no second row table)."""
+    raw = pd.read_excel(file_name)
+    duplicates = du.clean_transactions(raw[raw.duplicated()])
+    data = du.clean_transactions(raw.drop_duplicates())
+    forecast = fu.build_forecast_artifacts(data, duplicates)
+    return data, forecast
 
+
+def prepare_data(file_name):
+    data, _ = load_dashboard_bundle(file_name)
     return data
 
 
@@ -510,7 +512,154 @@ def show_sales_charts(
     )
 
 
-data = prepare_data("B2B_Transaction_Data_.xlsx")
+def show_method_notes(notes, duplicate_info, test_weeks):
+    with st.expander("Method notes"):
+        st.markdown(f"""
+**Data base.** Forecast uses the same valid transactions as the Sales tab:
+exact duplicates removed, rows with any missing field dropped, positive
+Quantity, NetPrice and UnitPrice, and a valid InvoiceDate
+({notes["input_rows"]:,} rows, {notes["input_units"]:,.0f} units). Only
+InvoiceDate, Category and Quantity are used.
+
+**Weekly demand.** Quantity is summed per Monday-start week; weeks without
+sales count as 0. Weeks that do not cover seven days of data are excluded.
+
+**Model selection and backtest.** The last {test_weeks} weeks are held out as
+the test period. Naive (last week's actual) and Moving Averages over 2, 4 and 8
+weeks are compared on the training weeks only, with rolling one-step-ahead
+forecasts after an 8-week warm-up (validation). The method with the lowest
+validation MAE is recommended (ties go to the simpler method). Every method is
+then scored once on the test weeks; test results are never used for selection.
+
+**Data sufficiency.** A series needs at least {fu.minimum_weeks(test_weeks)}
+weeks (8 warm-up + {fu.MIN_VALIDATION_WEEKS} validation + {test_weeks} test) and
+sales in at least {fu.MIN_ACTIVE_SHARE:.0%} of weeks. When most weeks are zero
+(intermittent demand), Naive and Moving Average forecasts swing between zero
+and spikes and MAE becomes misleading; such series need intermittent-demand
+methods (e.g. Croston), which are out of scope.
+
+{fu.duplicate_note(duplicate_info)}
+""")
+
+
+def show_forecast_tab(forecast):
+    weekly_table = forecast["weekly_table"]
+    notes = forecast["notes"]
+    duplicate_info = forecast["duplicate_info"]
+    categories = sorted(c for c in weekly_table.columns if c != fu.TOTAL)
+
+    with st.form("forecast_form"):
+        columns = st.columns([1, 2, 1])
+        scope = columns[0].radio("Scope", ["Overall", "Category"])
+        category = columns[1].selectbox("Category", categories)
+        test_weeks = columns[2].slider(
+            "Test weeks", 4, 16, fu.DEFAULT_TEST_WEEKS
+        )
+        st.form_submit_button("Apply")
+
+    column = category if scope == "Category" else fu.TOTAL
+    series = weekly_table[column]
+    result = fu.compare_methods(series, test_weeks=test_weeks)
+
+    if not result.ok:
+        for message in result.warnings:
+            st.warning(f"**{column}**: {message} No forecast is shown for this series.")
+        show_method_notes(notes, duplicate_info, test_weeks)
+        return
+
+    last_week = series.index[-1]
+    st.markdown(
+        '<div class="section-title">Next Week Forecast</div>',
+        unsafe_allow_html=True,
+    )
+    left, right = st.columns([1, 3])
+    left.metric(
+        f"Week of {result.next_week:%d %b %Y}",
+        f"{result.next_week_forecast:,.0f} units",
+        f"Method: {result.recommended_method}",
+        delta_color="off", delta_arrow="off",
+    )
+    partial_note = (
+        f" The week of {notes['partial_week']:%d %b %Y} has only "
+        f"{notes['partial_days']} days of data (up to {notes['last_date']:%d %b %Y}); "
+        "that partial week is not used for training or evaluation."
+        if notes["partial_week"] is not None else ""
+    )
+    right.caption(
+        f"One-week-ahead forecast made from the last complete week "
+        f"(week of {last_week:%d %b %Y}) with the recommended method, using all "
+        f"complete weeks up to that point. It is not a forecast beyond the end "
+        f"of the data set.{partial_note}"
+    )
+
+    st.markdown(
+        f'<div class="section-title">Backtest · last {test_weeks} weeks '
+        f"(held out, scored once)</div>",
+        unsafe_allow_html=True,
+    )
+    columns = st.columns(4)
+    columns[0].metric(
+        "Recommended Method", result.recommended_method,
+        f"Test MAE {result.recommended_test_mae:,.1f}",
+        delta_color="off", delta_arrow="off",
+        help=f"Lowest validation MAE over {result.validation_weeks} training weeks.",
+    )
+    columns[1].metric(
+        "Best Moving Average", result.best_ma_method,
+        f"Test MAE {result.best_ma_test_mae:,.1f}",
+        delta_color="off", delta_arrow="off",
+        help="Moving Average window with the lowest validation MAE.",
+    )
+    label, value, caption = fu.improvement_card(result)
+    columns[2].metric(label, value, caption, delta_color="off", delta_arrow="off")
+    columns[3].metric(
+        f"Forecast Bias · {result.recommended_method}",
+        f"{result.bias_pct:+.1f}%" if result.bias_pct is not None else "—",
+        f"{result.bias:+,.1f} units/week ({result.bias_label})",
+        delta_color="off", delta_arrow="off",
+    )
+
+    left, right = st.columns(2)
+    with left:
+        with st.container(border=True):
+            st.markdown(f"**Actual vs Forecast · {column}**")
+            next_point = pd.Series(
+                [series.iloc[-1], result.next_week_forecast],
+                index=[last_week, result.next_week],
+                name="Next week forecast",
+            )
+            history = pd.concat(
+                [
+                    series.rename("Actual"),
+                    result.forecasts.drop(columns="Actual").add_suffix(" (backtest)"),
+                    next_point,
+                ],
+                axis=1,
+            )
+            st.line_chart(history, height=260)
+    with right:
+        with st.container(border=True):
+            st.markdown(f"**Test MAE by Method · last {test_weeks} weeks**")
+            st.bar_chart(result.metrics.set_index("Method")["Test MAE"], height=260)
+
+    st.dataframe(
+        result.metrics,
+        hide_index=True,
+        use_container_width=True,
+        column_config={
+            "Validation MAE": st.column_config.NumberColumn(format="%.1f"),
+            "Test MAE": st.column_config.NumberColumn(format="%.1f"),
+            "Test Bias": st.column_config.NumberColumn(format="%+.1f"),
+            "Test Bias %": st.column_config.NumberColumn(format="%+.1f%%"),
+            "Test Improvement vs Naive %": st.column_config.NumberColumn(
+                format="%+.1f%%"
+            ),
+        },
+    )
+    show_method_notes(notes, duplicate_info, test_weeks)
+
+
+data, forecast_bundle = load_dashboard_bundle("B2B_Transaction_Data_.xlsx")
 
 filter_options = {
     "dates": sorted(data["InvoiceDate"].dropna().astype(str).unique()),
@@ -692,12 +841,13 @@ with product_tab:
     show_chart_placeholders(["Sales by Category", "Top Products"])
 
 with forecast_tab:
-    show_cards(["Forecasted Demand", "Forecast Method", "Forecast Error", "Forecast Horizon"])
-    st.markdown('<div class="section-title">Filters</div>', unsafe_allow_html=True)
-    show_filters(data, "forecast", filter_options)
-    show_chart_placeholders(["Actual vs Forecast", "Forecast Error by Method"])
+    show_forecast_tab(forecast_bundle)
 
 with raw_tab:
     st.markdown('<div class="section-title">Filters</div>', unsafe_allow_html=True)
     raw_data = show_filters(data, "raw", filter_options)
-    st.dataframe(raw_data, use_container_width=True)
+    preview_rows = st.selectbox("Preview rows", [1000, 5000, 10000], key="raw_rows")
+    st.caption(f"Showing {min(preview_rows, len(raw_data)):,} of {len(raw_data):,} filtered rows")
+    preview = raw_data.head(preview_rows).copy()
+    preview["Description"] = preview["Description"].astype(str)
+    st.dataframe(preview, use_container_width=True)
