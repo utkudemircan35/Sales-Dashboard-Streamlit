@@ -523,6 +523,182 @@ def show_sales_charts(
     )
 
 
+@st.cache_data(show_spinner="Calculating customer analysis...")
+def run_customer_analysis(customer_data):
+    customer_frequency = (
+        customer_data.groupby("CustomerID", observed=True)["InvoiceNo"]
+        .nunique()
+        .reset_index(name="OrderCount")
+        .sort_values("OrderCount", ascending=False)
+    )
+
+    customer_value = (
+        customer_data.groupby("CustomerID", observed=True)
+        .agg(
+            TotalRevenue=("SalesAmount", "sum"),
+            TotalOrders=("InvoiceNo", "nunique"),
+        )
+        .reset_index()
+        .sort_values("TotalRevenue", ascending=False)
+    )
+    customer_value["AverageOrderValue"] = (
+        customer_value["TotalRevenue"] / customer_value["TotalOrders"]
+    )
+
+    return customer_frequency, customer_value
+
+
+def render_customer_page(customer_data):
+    overview_area = st.container()
+    value_area = st.container()
+
+    st.markdown(
+        '<div class="section-title">Filters</div>',
+        unsafe_allow_html=True,
+    )
+    customer_data = show_filters(customer_data, "customer", filter_options)
+
+    if customer_data.empty:
+        with overview_area:
+            show_cards([
+                "Total Customers",
+                "Total Orders",
+                "Total Transactions",
+                "Repeat Purchase Rate",
+            ])
+        st.warning("No data available for the selected filters.")
+        return
+
+    customer_frequency, customer_value = run_customer_analysis(customer_data)
+
+    total_customers = len(customer_frequency)
+    total_orders = customer_data["InvoiceNo"].nunique()
+    total_transactions = len(customer_data)
+    repeat_customers = int((customer_frequency["OrderCount"] > 1).sum())
+    repeat_purchase_rate = (
+        repeat_customers / total_customers * 100 if total_customers else 0
+    )
+
+    total_revenue = customer_value["TotalRevenue"].sum()
+    average_order_value = total_revenue / total_orders if total_orders else 0
+    average_customer_revenue = (
+        customer_value["TotalRevenue"].mean()
+        if not customer_value.empty else 0
+    )
+
+    with overview_area:
+        st.markdown(
+            '<div class="section-title">Customer Overview</div>',
+            unsafe_allow_html=True,
+        )
+        columns = st.columns(4)
+        columns[0].metric("Total Customers", format_number(total_customers))
+        columns[1].metric("Total Orders", format_number(total_orders))
+        columns[2].metric(
+            "Total Transactions",
+            format_number(total_transactions),
+        )
+        columns[3].metric(
+            "Repeat Purchase Rate",
+            f"{format_number(repeat_purchase_rate, 1)}%",
+        )
+
+    with value_area:
+        st.markdown(
+            '<div class="section-title">Customer Value</div>',
+            unsafe_allow_html=True,
+        )
+        columns = st.columns(4)
+        columns[0].metric(
+            "Repeat Customers",
+            format_number(repeat_customers),
+        )
+        columns[1].metric(
+            "Estimated Net Sales",
+            format_number(total_revenue, 2),
+        )
+        columns[2].metric(
+            "Average Order Value",
+            format_number(average_order_value, 2),
+        )
+        columns[3].metric(
+            "Average Customer Revenue",
+            format_number(average_customer_revenue, 2),
+        )
+
+    top_frequency = customer_frequency.head(10).copy()
+    top_frequency["CustomerID"] = top_frequency["CustomerID"].astype(str)
+
+    top_value = customer_value.head(10).copy()
+    top_value["CustomerID"] = top_value["CustomerID"].astype(str)
+    top_value["TotalRevenue"] = top_value["TotalRevenue"].round().astype(int)
+
+    frequency_chart = (
+        alt.Chart(top_frequency)
+        .mark_bar(color="#B4232F", cornerRadiusEnd=3)
+        .encode(
+            x=alt.X("OrderCount:Q", title="Number of Orders"),
+            y=alt.Y("CustomerID:N", title="Customer ID", sort="-x"),
+            tooltip=[
+                alt.Tooltip("CustomerID:N", title="Customer ID"),
+                alt.Tooltip("OrderCount:Q", title="Orders", format=",.0f"),
+            ],
+        )
+    )
+
+    revenue_chart = (
+        alt.Chart(top_value)
+        .mark_bar(color="#B4232F", cornerRadiusEnd=3)
+        .encode(
+            x=alt.X(
+                "TotalRevenue:Q",
+                title="Total Revenue",
+                axis=alt.Axis(format=",.0f"),
+            ),
+            y=alt.Y("CustomerID:N", title="Customer ID", sort="-x"),
+            tooltip=[
+                alt.Tooltip("CustomerID:N", title="Customer ID"),
+                alt.Tooltip(
+                    "TotalRevenue:Q",
+                    title="Total Revenue",
+                    format=",.0f",
+                ),
+            ],
+        )
+    )
+
+    left, right = st.columns(2)
+    show_chart(
+        left,
+        "Top 10 Customers by Purchase Frequency",
+        frequency_chart,
+        top_frequency.empty,
+    )
+    show_chart(
+        right,
+        "Top 10 Customers by Revenue",
+        revenue_chart,
+        top_value.empty,
+    )
+
+    with st.expander("Customer Analysis Tables"):
+        left, right = st.columns(2)
+        with left:
+            st.markdown("**Purchase Frequency**")
+            st.dataframe(
+                customer_frequency.head(10),
+                use_container_width=True,
+                hide_index=True,
+            )
+        with right:
+            st.markdown("**Monetary Value**")
+            st.dataframe(
+                customer_value.head(10),
+                use_container_width=True,
+                hide_index=True,
+            )
+
+
 def category_performance(data):
     category_data = (
         data.groupby("Category", observed=True)
@@ -1147,10 +1323,7 @@ if active_tab == "Sales & Cities":
     )
 
 elif active_tab == "Customer & Marketing":
-    show_cards(["Customers", "Repeat Customers", "Customer Value", "RFM Segment"])
-    st.markdown('<div class="section-title">Filters</div>', unsafe_allow_html=True)
-    show_filters(data, "customer", filter_options)
-    show_chart_placeholders(["Customer Segments", "Customer Value"])
+    render_customer_page(data)
 
 elif active_tab == "Product & Supply":
     render_product_page(data)
