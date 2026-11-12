@@ -1,6 +1,7 @@
 import pandas as pd
 import streamlit as st
 import altair as alt
+from pathlib import Path
 
 st.set_page_config(
     page_title="Bookstore B2B  Dashboard",
@@ -77,16 +78,28 @@ h1, h2, h3, p, label {
 """, unsafe_allow_html=True)
 
 
+@st.cache_data(
+    show_spinner="Loading transaction data...",
+    max_entries=1,
+)
 def prepare_data(file_name):
+    prepared_file = Path(file_name).with_name(
+        "B2B_Transaction_Data_prepared.parquet"
+    )
+
+    if prepared_file.exists():
+        return pd.read_parquet(prepared_file)
+
     data = pd.read_excel(file_name)
     data = data.drop_duplicates()
-    data= data.dropna()
+    data = data.dropna()
     data = data[
         (data["Quantity"] > 0) &
         (data["NetPrice"] > 0) &
         (data["UnitPrice"] > 0)
     ]
     data["InvoiceDate"] = pd.to_datetime(data["InvoiceDate"])
+    data["Description"] = data["Description"].astype(str)
     data["SalesAmount"] = data["Quantity"] * data["NetPrice"]
     data["Week"] = data["InvoiceDate"].dt.isocalendar().week
     data["Month"] = data["InvoiceDate"].dt.month
@@ -510,6 +523,454 @@ def show_sales_charts(
     )
 
 
+def category_performance(data):
+    category_data = (
+        data.groupby("Category", observed=True)
+        .agg(
+            TotalRevenue=("SalesAmount", "sum"),
+            TotalUnits=("Quantity", "sum"),
+            ProductCount=("StockCode", "nunique"),
+            InvoiceCount=("InvoiceNo", "nunique"),
+        )
+        .sort_values("TotalRevenue", ascending=False)
+        .reset_index()
+    )
+    category_data["RevenueShare"] = (
+        category_data["TotalRevenue"] / category_data["TotalRevenue"].sum()
+    )
+    return category_data
+
+
+def product_performance(data):
+    products = (
+        data.groupby("StockCode", observed=True)
+        .agg(
+            Description=("Description", "first"),
+            Category=("Category", "first"),
+            TotalRevenue=("SalesAmount", "sum"),
+            TotalUnits=("Quantity", "sum"),
+        )
+        .sort_values("TotalRevenue", ascending=False)
+        .reset_index()
+    )
+    products["Description"] = products["Description"].astype(str)
+    products["Category"] = products["Category"].astype(str)
+    return products
+
+
+def xyz_classification(value):
+    if value <= 0.5:
+        return "X"
+    if value <= 1:
+        return "Y"
+    return "Z"
+
+
+def abc_classification(value):
+    if value <= 0.80:
+        return "A"
+    if value <= 0.95:
+        return "B"
+    return "C"
+
+
+def abc_xyz_analysis(data):
+    months = sorted(data["Month"].unique())
+
+    monthly_products = (
+        data.groupby(["StockCode", "Month"], observed=True)["SalesAmount"]
+        .sum()
+        .reset_index()
+    )
+    monthly_pivot = monthly_products.pivot(
+        index="StockCode",
+        columns="Month",
+        values="SalesAmount",
+    )
+    monthly_pivot = monthly_pivot.reindex(columns=months).fillna(0)
+
+    monthly_pivot["TotalSales"] = monthly_pivot[months].sum(axis=1)
+    monthly_pivot["AverageSales"] = monthly_pivot["TotalSales"] / len(months)
+    monthly_pivot["StandardDeviation"] = monthly_pivot[months].std(axis=1)
+    monthly_pivot["CV"] = (
+        monthly_pivot["StandardDeviation"] / monthly_pivot["AverageSales"]
+    ).fillna(0)
+    monthly_pivot["XYZClass"] = monthly_pivot["CV"].apply(
+        xyz_classification
+    )
+    monthly_pivot = monthly_pivot.reset_index()
+
+    abc_data = (
+        monthly_pivot[["StockCode", "TotalSales"]]
+        .sort_values("TotalSales", ascending=False)
+        .reset_index(drop=True)
+    )
+    abc_data["CumulativeSales"] = abc_data["TotalSales"].cumsum()
+    abc_data["CumulativeShare"] = (
+        abc_data["CumulativeSales"] / abc_data["TotalSales"].sum()
+    )
+    abc_data["ABCClass"] = abc_data["CumulativeShare"].apply(
+        abc_classification
+    )
+
+    abc_data = abc_data.merge(
+        monthly_pivot[
+            [
+                "StockCode",
+                "AverageSales",
+                "StandardDeviation",
+                "CV",
+                "XYZClass",
+            ]
+        ],
+        on="StockCode",
+        how="left",
+    )
+
+    product_names = data.drop_duplicates("StockCode")[
+        ["StockCode", "Description", "Category"]
+    ]
+    abc_data = abc_data.merge(product_names, on="StockCode", how="left")
+    abc_data["Description"] = abc_data["Description"].astype(str)
+    abc_data["Category"] = abc_data["Category"].astype(str)
+    abc_data["StockClass"] = abc_data["ABCClass"] + abc_data["XYZClass"]
+    abc_data["ProductRank"] = abc_data.index + 1
+    return abc_data
+
+
+@st.cache_data(show_spinner="Calculating product analysis...")
+def run_product_analysis(product_data):
+    return category_performance(product_data), abc_xyz_analysis(product_data)
+
+
+def render_product_page(product_data):
+    card_area = st.container()
+
+    st.markdown(
+        '<div class="section-title">Filters</div>',
+        unsafe_allow_html=True,
+    )
+    product_data = show_filters(product_data, "product", filter_options)
+
+    if product_data.empty:
+        with card_area:
+            show_cards(["Active Products", "Best Product Revenue", "Top Category", "A-Class Products"])
+        st.warning("No data available for the selected filters.")
+        return
+
+    category_data, abc_data = run_product_analysis(product_data)
+
+    if product_data["Month"].nunique() < 3:
+        st.warning(
+            "Demand variability (XYZ) needs at least 3 months of data. "
+            "Please widen the date filter."
+        )
+
+    a_count = int((abc_data["ABCClass"] == "A").sum())
+    top_product = abc_data.iloc[0]
+    top_category = category_data.iloc[0]
+
+    with card_area:
+        st.markdown(
+            '<div class="section-title">Product Overview</div>',
+            unsafe_allow_html=True,
+        )
+        columns = st.columns(4)
+        columns[0].metric("Active Products", format_number(len(abc_data)))
+        columns[1].metric(
+            "Best Product Revenue",
+            format_number(top_product["TotalSales"]),
+        )
+        columns[2].metric(
+            "Top Category",
+            top_category["Category"],
+            f"{format_number(top_category['RevenueShare'] * 100, 1)}% of revenue",
+            delta_color="off",
+        )
+        columns[3].metric(
+            "A-Class Products",
+            format_number(a_count),
+            f"{format_number(a_count / len(abc_data) * 100, 1)}% of products",
+            delta_color="off",
+        )
+
+    category_tab, abc_tab, xyz_tab, insight_tab = st.tabs([
+        "Category Performance",
+        "ABC Analysis",
+        "Demand Variability (XYZ)",
+        "Insights",
+    ])
+
+    with category_tab:
+        maximum = min(30, len(category_data))
+        category_count = st.slider(
+            "Number of categories to show",
+            1,
+            maximum,
+            min(15, maximum),
+        )
+        top_categories = category_data.head(category_count)
+
+        category_chart = (
+            alt.Chart(top_categories)
+            .mark_bar(color="#B4232F", cornerRadiusEnd=3)
+            .encode(
+                x=alt.X(
+                    "TotalRevenue:Q",
+                    title="Revenue",
+                    axis=alt.Axis(format=",.0f"),
+                ),
+                y=alt.Y("Category:N", title="Category", sort="-x"),
+                tooltip=[
+                    alt.Tooltip("Category:N", title="Category"),
+                    alt.Tooltip(
+                        "TotalRevenue:Q",
+                        title="Revenue",
+                        format=",.0f",
+                    ),
+                    alt.Tooltip("TotalUnits:Q", title="Units", format=",.0f"),
+                ],
+            )
+        )
+        show_chart(
+            st.container(),
+            "Revenue by Category",
+            category_chart,
+            top_categories.empty,
+        )
+
+        selected_category = st.selectbox(
+            "Category details",
+            category_data["Category"],
+        )
+        selected_data = product_data[
+            product_data["Category"] == selected_category
+        ]
+        monthly_category = (
+            selected_data.groupby("Month", observed=True)["SalesAmount"]
+            .sum()
+            .round()
+            .reset_index()
+        )
+        monthly_chart = (
+            alt.Chart(monthly_category)
+            .mark_line(color="#B4232F", point=True, strokeWidth=2)
+            .encode(
+                x=alt.X("Month:O", title="Month"),
+                y=alt.Y(
+                    "SalesAmount:Q",
+                    title="Revenue",
+                    axis=alt.Axis(format=",.0f"),
+                ),
+                tooltip=[
+                    alt.Tooltip("Month:O", title="Month"),
+                    alt.Tooltip(
+                        "SalesAmount:Q",
+                        title="Revenue",
+                        format=",.0f",
+                    ),
+                ],
+            )
+        )
+        show_chart(
+            st.container(),
+            f"Monthly Revenue of {selected_category}",
+            monthly_chart,
+            monthly_category.empty,
+        )
+
+        st.markdown("**Best Selling Products in This Category**")
+        best_products = product_performance(selected_data).head(10)
+        st.dataframe(
+            best_products[["Description", "TotalRevenue", "TotalUnits"]],
+            hide_index=True,
+            use_container_width=True,
+        )
+
+    with abc_tab:
+        abc_summary = (
+            abc_data.groupby("ABCClass", observed=True)
+            .agg(
+                ProductCount=("StockCode", "count"),
+                Revenue=("TotalSales", "sum"),
+            )
+            .reset_index()
+        )
+        abc_summary["RevenueShare"] = (
+            abc_summary["Revenue"] / abc_summary["Revenue"].sum()
+        )
+        abc_summary["ProductShare"] = (
+            abc_summary["ProductCount"] / abc_summary["ProductCount"].sum()
+        )
+        abc_summary["RevenueShare"] = abc_summary["RevenueShare"] * 100
+        abc_summary["ProductShare"] = abc_summary["ProductShare"] * 100
+        st.dataframe(
+            abc_summary,
+            hide_index=True,
+            use_container_width=True,
+            column_config={
+                "Revenue": st.column_config.NumberColumn(format="%.0f"),
+                "RevenueShare": st.column_config.NumberColumn(format="%.1f%%"),
+                "ProductShare": st.column_config.NumberColumn(format="%.1f%%"),
+            },
+        )
+
+        step = max(1, len(abc_data) // 2000)
+        pareto_data = abc_data.iloc[::step]
+        pareto_line = (
+            alt.Chart(pareto_data)
+            .mark_line(color="#B4232F", strokeWidth=2)
+            .encode(
+                x=alt.X("ProductRank:Q", title="Product Rank"),
+                y=alt.Y(
+                    "CumulativeShare:Q",
+                    title="Cumulative Revenue Share",
+                    axis=alt.Axis(format=".0%"),
+                ),
+                tooltip=[
+                    alt.Tooltip("ProductRank:Q", title="Rank"),
+                    alt.Tooltip(
+                        "CumulativeShare:Q",
+                        title="Cumulative Share",
+                        format=".1%",
+                    ),
+                ],
+            )
+        )
+        threshold_data = pd.DataFrame({"Threshold": [0.80, 0.95]})
+        threshold_lines = (
+            alt.Chart(threshold_data)
+            .mark_rule(color="#777777", strokeDash=[5, 5])
+            .encode(y="Threshold:Q")
+        )
+        show_chart(
+            st.container(),
+            "Pareto Curve: Cumulative Revenue Share of Products",
+            pareto_line + threshold_lines,
+            pareto_data.empty,
+        )
+
+        selected_abc = st.selectbox(
+            "Show products of ABC class",
+            ["A", "B", "C"],
+        )
+        st.dataframe(
+            abc_data[abc_data["ABCClass"] == selected_abc][
+                ["Description", "Category", "TotalSales", "CV", "StockClass"]
+            ].head(100),
+            hide_index=True,
+            use_container_width=True,
+        )
+
+    with xyz_tab:
+        matrix = (
+            abc_data.groupby(["ABCClass", "XYZClass"], observed=True)
+            .size()
+            .reset_index(name="ProductCount")
+        )
+        heatmap_base = alt.Chart(matrix).encode(
+            x=alt.X("XYZClass:N", title="XYZ Class", sort=["X", "Y", "Z"]),
+            y=alt.Y("ABCClass:N", title="ABC Class", sort=["A", "B", "C"]),
+        )
+        heatmap = heatmap_base.mark_rect().encode(
+            color=alt.Color(
+                "ProductCount:Q",
+                scale=alt.Scale(range=["#F8E8EA", "#B4232F"]),
+                legend=alt.Legend(title="Products"),
+            ),
+            tooltip=[
+                alt.Tooltip("ABCClass:N", title="ABC Class"),
+                alt.Tooltip("XYZClass:N", title="XYZ Class"),
+                alt.Tooltip("ProductCount:Q", title="Products"),
+            ],
+        ) + heatmap_base.mark_text().encode(
+            text="ProductCount:Q",
+            color=alt.condition(
+                alt.datum.ProductCount > matrix["ProductCount"].max() / 2,
+                alt.value("white"),
+                alt.value("#171717"),
+            ),
+        )
+        show_chart(
+            st.container(),
+            "Number of Products in Each ABC-XYZ Class",
+            heatmap,
+            matrix.empty,
+        )
+        st.caption(
+            "X: CV ≤ 0,5 (stable), Y: 0,5 < CV ≤ 1 (medium), "
+            "Z: CV > 1 (highly variable). CV = monthly standard deviation / average."
+        )
+
+        cv_data = abc_data[abc_data["CV"] <= 4]
+        cv_histogram = (
+            alt.Chart(cv_data)
+            .mark_bar(color="#B4232F")
+            .encode(
+                x=alt.X("CV:Q", bin=alt.Bin(maxbins=40), title="CV"),
+                y=alt.Y("count():Q", title="Product Count"),
+                tooltip=[alt.Tooltip("count():Q", title="Products")],
+            )
+        )
+        show_chart(
+            st.container(),
+            "Distribution of CV (CV ≤ 4)",
+            cv_histogram,
+            cv_data.empty,
+        )
+
+        class_list = sorted(abc_data["StockClass"].unique())
+        default_class = class_list.index("AZ") if "AZ" in class_list else 0
+        selected_class = st.selectbox(
+            "Show products of class",
+            class_list,
+            index=default_class,
+        )
+        st.dataframe(
+            abc_data[abc_data["StockClass"] == selected_class][
+                ["Description", "Category", "TotalSales", "CV"]
+            ].head(100),
+            hide_index=True,
+            use_container_width=True,
+        )
+
+    with insight_tab:
+        a_products = abc_data[abc_data["ABCClass"] == "A"]
+        c_products = abc_data[abc_data["ABCClass"] == "C"]
+        a_share = a_count / len(abc_data)
+        c_share = len(c_products) / len(abc_data)
+        c_revenue_share = (
+            c_products["TotalSales"].sum() / abc_data["TotalSales"].sum()
+        )
+        az_count = int((abc_data["StockClass"] == "AZ").sum())
+        az_share = az_count / len(a_products) if len(a_products) else 0
+        top_five_share = category_data.head(5)["RevenueShare"].sum()
+        monthly_total = product_data.groupby("Month")["SalesAmount"].sum()
+        month_names = {
+            1: "January", 2: "February", 3: "March", 4: "April",
+            5: "May", 6: "June", 7: "July", 8: "August",
+            9: "September", 10: "October", 11: "November", 12: "December",
+        }
+
+        st.info(
+            f"**Insight 1 - Concentration:** {format_number(a_share * 100, 1)}% "
+            f"of products ({format_number(a_count)} items) create approximately "
+            f"80% of revenue, while {format_number(c_share * 100, 1)}% of products "
+            f"create only {format_number(c_revenue_share * 100, 1)}%."
+        )
+        st.warning(
+            f"**Insight 2 - Risky A Products:** {format_number(az_count)} of "
+            f"{format_number(len(a_products))} A-class products "
+            f"({format_number(az_share * 100, 1)}%) have highly variable demand."
+        )
+        st.success(
+            f"**Category and Season:** The top 5 categories bring "
+            f"{format_number(top_five_share * 100, 1)}% of revenue. "
+            f"Best month is {month_names[monthly_total.idxmax()]} and weakest "
+            f"month is {month_names[monthly_total.idxmin()]}."
+        )
+
+
 data = prepare_data("B2B_Transaction_Data_.xlsx")
 
 filter_options = {
@@ -526,15 +987,21 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-sales_tab, customer_tab, product_tab, forecast_tab, raw_tab = st.tabs([
-    "Sales & Cities",
-    "Customer & Marketing",
-    "Product & Supply",
-    "Forecast & Integration",
-    "Filtered & Raw Data",
-])
+sales_tab, customer_tab, product_tab, forecast_tab, raw_tab = st.tabs(
+    [
+        "Sales & Cities",
+        "Customer & Marketing",
+        "Product & Supply",
+        "Forecast & Integration",
+        "Filtered & Raw Data",
+    ],
+    key="main_tabs",
+    on_change="rerun",
+)
 
-with sales_tab:
+active_tab = st.session_state.get("main_tabs", "Sales & Cities")
+
+if active_tab == "Sales & Cities":
     top_cards = st.container()
     lower_cards = st.container()
 
@@ -679,25 +1146,28 @@ with sales_tab:
         city_sales,
     )
 
-with customer_tab:
+elif active_tab == "Customer & Marketing":
     show_cards(["Customers", "Repeat Customers", "Customer Value", "RFM Segment"])
     st.markdown('<div class="section-title">Filters</div>', unsafe_allow_html=True)
     show_filters(data, "customer", filter_options)
     show_chart_placeholders(["Customer Segments", "Customer Value"])
 
-with product_tab:
-    show_cards(["Units Sold", "Top Product", "Top Category", "Product Share"])
-    st.markdown('<div class="section-title">Filters</div>', unsafe_allow_html=True)
-    show_filters(data, "product", filter_options)
-    show_chart_placeholders(["Sales by Category", "Top Products"])
+elif active_tab == "Product & Supply":
+    render_product_page(data)
 
-with forecast_tab:
+elif active_tab == "Forecast & Integration":
     show_cards(["Forecasted Demand", "Forecast Method", "Forecast Error", "Forecast Horizon"])
     st.markdown('<div class="section-title">Filters</div>', unsafe_allow_html=True)
     show_filters(data, "forecast", filter_options)
     show_chart_placeholders(["Actual vs Forecast", "Forecast Error by Method"])
 
-with raw_tab:
+elif active_tab == "Filtered & Raw Data":
     st.markdown('<div class="section-title">Filters</div>', unsafe_allow_html=True)
     raw_data = show_filters(data, "raw", filter_options)
-    st.dataframe(raw_data, use_container_width=True)
+    preview = raw_data.head(5000).copy()
+    preview["Description"] = preview["Description"].astype(str)
+    st.caption(
+        f"Showing the first {format_number(len(preview))} of "
+        f"{format_number(len(raw_data))} filtered rows."
+    )
+    st.dataframe(preview, use_container_width=True)

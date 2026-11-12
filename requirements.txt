@@ -1,4 +1,5 @@
 pandas
 openpyxl
-streamlit
+streamlit>=1.62
 altair
+pyarrow
