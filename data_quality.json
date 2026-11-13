@@ -1,0 +1,28 @@
+{
+  "raw_rows": 664154,
+  "clean_rows": 657925,
+  "steps": [
+    {
+      "Reason": "Exact duplicate rows",
+      "Rows removed": 6213
+    },
+    {
+      "Reason": "Missing or invalid essential fields",
+      "Rows removed": 6
+    },
+    {
+      "Reason": "Negative quantities: review as possible returns",
+      "Rows removed": 0
+    },
+    {
+      "Reason": "Zero quantity or non-positive net price",
+      "Rows removed": 10
+    }
+  ],
+  "unknown_city_rows": 6002,
+  "unknown_category_rows": 63,
+  "possible_return_rows": 0,
+  "possible_return_signed_amount": 0.0,
+  "source_sha256": "e505b56d1c4d294db7f419fe3833ef6442caeb1dc6744012c6187ed8d0817572",
+  "cleaning_version": 1
+}

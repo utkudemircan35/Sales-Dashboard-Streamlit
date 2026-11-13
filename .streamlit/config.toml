@@ -1,7 +1,28 @@
 [theme]
 base = "light"
-primaryColor = "#B4232F"
-backgroundColor = "#FFFFFF"
+primaryColor = "#C52F43"
+backgroundColor = "#FCFAF7"
 secondaryBackgroundColor = "#FFFFFF"
-textColor = "#171717"
-baseFontSize = 14
+textColor = "#29242A"
+font = "sans-serif"
+headingFont = "serif"
+baseFontSize = 16
+metricValueFontSize = "1.2rem"
+metricValueFontWeight = 600
+borderColor = "#DED5D6"
+baseRadius = "0.65rem"
+showSidebarBorder = true
+chartCategoricalColors = ["#C52F43", "#53515C", "#E98A91", "#AD7A46", "#A4A0A7"]
+blueColor = "#52697D"
+blueBackgroundColor = "#EDF1F5"
+blueTextColor = "#33495F"
+redColor = "#C52F43"
+redBackgroundColor = "#FBE6E9"
+redTextColor = "#A52134"
+
+[theme.sidebar]
+backgroundColor = "#292229"
+secondaryBackgroundColor = "#40343C"
+textColor = "#FFF6F3"
+primaryColor = "#F29BA6"
+borderColor = "#75606A"
